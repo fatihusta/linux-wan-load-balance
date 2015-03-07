@@ -1,5 +1,9 @@
 #!/bin/bash
 #chkconfig: 2345 95 20
+#@author Fatih USTA
+#@date 2015/03/07
+#http://fatihusta.com
+#https://github.com/fatihusta/linux-wan-load-balance
 
 script=/usr/sbin/wan_load_balance
 

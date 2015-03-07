@@ -1,4 +1,9 @@
 #!/bin/bash
+#@author Fatih USTA
+#@date 2015/03/07
+#http://fatihusta.com
+#https://github.com/fatihusta/linux-wan-load-balance
+
 config_cache=/etc/sysconfig/wan-load-balance/wlb.conf.cache
 config_failover=/etc/sysconfig/wan-load-balance/wlb.conf.failover
 statedir=/tmp/

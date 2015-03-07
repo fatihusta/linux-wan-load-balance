@@ -1,15 +1,8 @@
 #!/bin/bash -x
-# Output traffic ve next hop olmadan çalışma. - restore mark ve ve main route bütün route table lara basılınca sorun çözüldü. ve OUTPUT zincirine WLB_PRE member edildi.
-# Lan interface ihtiyacı - restore mark interface olmadan çalıştırıldı ve main route bütün route table lara basılınca sorun çözüldü.
-# rp_filter kapatılarak main table default route olmasa bile clientlar wlb table route bilgileri ile internete çıkabilirler.
-# iptables rule sıraları önemli. Bu durum düşünülmeli. - sıra numaraları config dosyasında verilebilir oldu. Kısmen çözüm
-# output için eklenen zincir özelleştirilebilir. Sadece output için bir zincir oluşturulabilir. yapıldı
-# Cihazın kendinden çıkan trafik yavaş dns ile ilgili - dnsmasq kurularak çözüldü
-# Webfilter kontrol edilecek. - Sorun yok çalışıyor.
-# interface down/up durumunda main route table down olan hattın table'ine import edilecek ve kendi default gw adresi yazılacak. - Yapıldı.
-# Conntrack bağımlılığı ve flush fonksiyonu yazılacak
-# Ubuntu/debian için kurulum setup hazırlanacak. 
-# Centos7/debian7 test edilecek.systemd kullanan sistemler için setup hazırlanacak.
+#@author Fatih USTA
+#@date 2015/03/07
+#http://fatihusta.com
+#https://github.com/fatihusta/linux-wan-load-balance
  
 configdir=/etc/sysconfig/wan-load-balance/
 config=/etc/sysconfig/wan-load-balance/wlb.conf
