@@ -1,0 +1,302 @@
+#!/bin/bash -x
+# Output traffic ve next hop olmadan çalışma. - restore mark ve ve main route bütün route table lara basılınca sorun çözüldü. ve OUTPUT zincirine WLB_PRE member edildi.
+# Lan interface ihtiyacı - restore mark interface olmadan çalıştırıldı ve main route bütün route table lara basılınca sorun çözüldü.
+# rp_filter kapatılarak main table default route olmasa bile clientlar wlb table route bilgileri ile internete çıkabilirler.
+# iptables rule sıraları önemli. Bu durum düşünülmeli. - sıra numaraları config dosyasında verilebilir oldu. Kısmen çözüm
+# output için eklenen zincir özelleştirilebilir. Sadece output için bir zincir oluşturulabilir. yapıldı
+# Cihazın kendinden çıkan trafik yavaş dns ile ilgili - dnsmasq kurularak çözüldü
+# Webfilter kontrol edilecek. - Sorun yok çalışıyor.
+# interface down/up durumunda main route table down olan hattın table'ine import edilecek ve kendi default gw adresi yazılacak. - Yapıldı.
+# Conntrack bağımlılığı ve flush fonksiyonu yazılacak
+# Ubuntu/debian için kurulum setup hazırlanacak. 
+# Centos7/debian7 test edilecek.systemd kullanan sistemler için setup hazırlanacak.
+ 
+configdir=/etc/sysconfig/wan-load-balance/
+config=/etc/sysconfig/wan-load-balance/wlb.conf
+config_cache=/etc/sysconfig/wan-load-balance/wlb.conf.cache
+config_failover=/etc/sysconfig/wan-load-balance/wlb.conf.failover
+rp_filter_orig=/etc/sysconfig/wan-load-balance/rp_filter.conf.orig
+dead_router_detection_functions=/usr/sbin/dead_router_detection
+
+_ip=`which ip`
+_iptables=`which iptables`
+
+
+
+if [ $(whoami) != "root" ]; then
+    echo "You must be root to run this!" ; echo ; exit 1
+fi
+
+if [ ! -d $configdir ]; then
+    mkdir $configdir
+fi
+
+function getvalue() {
+    index=$1
+    var=$2
+
+    n=1
+    for f in ${var} ; do
+        if [ "${n}" == "${index}" ]; then
+            echo "$f"
+            break
+        fi
+            n=$(($n + 1))
+    done
+}
+
+function start_wan_load_balancing() {
+    if [ -f $config ]; then
+        . $config
+    else
+        echo "Config file not found. >>> $config"
+        exit 1
+    fi
+
+    add_ip_forward_and_rp_filter_settings
+    add_route_and_rule_settings
+    add_netfilter_settings
+    add_netfilter_output_settings
+    $dead_router_detection_functions & 
+
+    if [[ `echo $?` == 0 ]]; then
+        `which cat` $config > $config_cache
+        `which cat` $config > $config_failover
+    fi
+    chkconfig --add wan-load-balance
+    chkconfig wan-load-balance on 
+}
+
+function stop_wan_load_balancing() {
+    if [ -f $config_cache ]; then
+        . $config_cache
+    else
+        echo "Config file not found. >>> $config_cache"
+        exit 1
+    fi
+
+    del_netfilter_settings
+    del_route_and_rule_settings
+    del_ip_forward_and_rp_filter_settings
+
+    chkconfig --del wan-load-balance
+    chkconfig wan-load-balance off 
+}
+
+function add_ip_forward_and_rp_filter_settings() {
+
+    if [[ $ip_forward == "y"  ]]; then
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+    fi
+    
+    if [[ $disable_rp_filter == "y"  ]]; then
+        sysctl -a | grep rp_filter | grep -v arp  | awk -F " " '{print $1$2$3}' > $rp_filter_orig
+        awk -F "=" '{print $1}' $rp_filter_orig | \
+        while read line ; do
+            sysctl -w "$line=0" 2&>1 > /dev/null
+        done 
+    fi
+}
+
+function del_ip_forward_and_rp_filter_settings() {
+
+    if [[ $ip_forward == "y"  ]]; then
+        echo 0 > /proc/sys/net/ipv4/ip_forward
+    fi
+    
+    if [[ $disable_rp_filter == "y"  ]]; then
+        while read line; do
+            sysctl -w $line 2&>1 > /dev/null
+        done < $rp_filter_orig
+    fi
+}
+
+function add_route_and_rule_settings() {
+
+    i=1
+    for wiface in $wan_ifaces; do 
+        #Load values
+        tid=$(getvalue $i "$route_table_ids")
+        fwmark=$(getvalue $i "$fwmarks")
+        router=$(getvalue $i "$routers")
+       
+        #Flush route table
+        $_ip route flush table $tid
+
+        #Default router add from table
+        $_ip route add table $tid default via $router dev $wiface
+
+        #netfilter fwmark add for routers
+        $_ip rule add fwmark $fwmark table $tid
+
+        i=$(($i + 1))
+    done
+
+    $_ip link add name wlb0 type dummy
+    $_ip link set dev wlb0 up
+    $_ip addr add $dummy_iface_ip/32 dev wlb0
+
+    $_ip route add default dev wlb0
+
+    i=1
+    for wan_iface_ip in $wan_iface_ips; do
+        tid=$(getvalue $i "$route_table_ids")
+        $_ip rule add from $wan_iface_ip table $tid
+        i=$(($i + 1))
+    done
+
+    $_ip route show table main | grep -Ev '^default|nexthop' | \
+    while read ROUTE ; do
+        for tid in $route_table_ids; do
+            $_ip route add table $tid $ROUTE
+        done
+    done
+
+}
+
+function del_route_and_rule_settings() {
+
+    i=1
+    for wiface in $wan_ifaces; do 
+        #Load values
+        tid=$(getvalue $i "$route_table_ids")
+        fwmark=$(getvalue $i "$fwmarks")
+        router=$(getvalue $i "$routers")
+       
+        #Flush route table
+        $_ip route flush table $tid 
+
+        #Delete table
+        $_ip route del table $tid 2&>1 > /dev/null
+
+        #netfilter fwmark delete for routers
+        $_ip rule del fwmark $fwmark table $tid
+
+        i=$(($i + 1))
+    done
+
+    #Default route table delete
+    $_ip route delete default 
+
+    $_ip link set dev wlb0 down
+    $_ip link del wlb0 
+
+    i=1
+    for wan_iface_ip in $wan_iface_ips; do
+        tid=$(getvalue $i "$route_table_ids")
+        $_ip rule del from $wan_iface_ip table $tid
+        i=$(($i + 1))
+    done
+}
+
+function add_netfilter_settings() {
+
+    #Create PREROUTING Chains
+    $_iptables -t mangle -N WLB_PRE
+    $_iptables -t mangle -I PREROUTING $wlb_pre_rule_no -j WLB_PRE
+
+    #Restore Mark
+    $_iptables -t mangle -I WLB_PRE -j CONNMARK --restore-mark
+
+    #Create Sticky incoming wan connection chain
+    if [[ $sticky_inbound_wan_connections == "y"  ]]; then
+        $_iptables -t mangle -N STICKY_CONN
+        $_iptables -t mangle -I PREROUTING $sticky_conn_rule_no -j STICKY_CONN
+    fi
+
+    #Create SNAT Chains
+    if [[ $wlb_snat_rule_no == "" ]];then
+        $_iptables -t nat -N WLB_SNAT
+        $_iptables -t nat -A POSTROUTING -j WLB_SNAT
+    else
+        $_iptables -t nat -N WLB_SNAT
+        $_iptables -t nat -I POSTROUTING $wlb_snat_rule_no -j WLB_SNAT
+    fi
+    i=1
+    #Create netfilter/iptables chains for wan ifaces
+    for wiface in $wan_ifaces; do 
+        #Load values
+        fwmark=$(getvalue $i "$fwmarks")
+        wan_iface_ip=$(getvalue $i "$wan_iface_ips")
+        router_weight=$(getvalue $i "$weights")
+
+        sum_weight=`echo $weights | tr ' ' '+' | bc`
+        weight=`echo "scale=6; 1/$sum_weight*$router_weight" | bc`
+
+        #Create Wan Load Balancing PREROUTING Chains and Rules
+        if [[ `echo $wan_ifaces | awk '{print $NF}'` != "$wiface" ]]; then
+            $_iptables -t mangle -A WLB_PRE -m mark --mark 0x0 -m statistic --mode random --probability 0$weight -j MARK --set-xmark $fwmark
+	
+        elif [[ `echo $wan_ifaces | awk '{print $NF}'` == "$wiface" ]]; then
+            $_iptables -t mangle -A WLB_PRE -m mark --mark 0x0 -j MARK --set-xmark $fwmark
+        fi
+
+        #Create Wan Load Balancing SNAT Rules
+        $_iptables -t nat -A WLB_SNAT -o $wiface -m mark --mark $fwmark -j SNAT --to-source $wan_iface_ip
+       
+        #If Sticky conneciton enable the apply
+        if [[ $sticky_inbound_wan_connections == "y"  ]]; then
+            $_iptables -t mangle -A STICKY_CONN -i "$wiface" -m mark --mark 0x0 -j MARK --set-xmark $fwmark
+        fi
+        
+        i=$(($i + 1))
+    done
+    #Create restore-mark rule and member WLB_PRE chain
+    $_iptables -t mangle -A WLB_PRE -j CONNMARK --save-mark
+}
+
+
+function add_netfilter_output_settings() {
+
+    #Create PREROUTING Chains
+    $_iptables -t mangle -N WLB_OUT
+
+    #WLB_PRE add OUTPUT Chain
+    $_iptables -t mangle -I OUTPUT $wlb_out_rule_no -j WLB_OUT
+
+    #Restore Mark
+    $_iptables -t mangle -I WLB_OUT -j CONNMARK --restore-mark
+
+    i=1
+    #Create netfilter/iptables chains for wan ifaces
+    for wiface in $wan_ifaces; do 
+        #Load values
+        fwmark=$(getvalue $i "$fwmarks")
+        wan_iface_ip=$(getvalue $i "$wan_iface_ips")
+        router_weight=$(getvalue $i "$weights")
+
+        sum_weight=`echo $weights | tr ' ' '+' | bc`
+        weight=`echo "scale=6; 1/$sum_weight*$router_weight" | bc`
+
+        #Create Wan Load Balancing PREROUTING Chains and Rules
+        if [[ `echo $wan_ifaces | awk '{print $NF}'` != "$wiface" ]]; then
+            $_iptables -t mangle -A WLB_OUT -m mark --mark 0x0 -m statistic --mode random --probability 0$weight -j MARK --set-xmark $fwmark
+	
+        elif [[ `echo $wan_ifaces | awk '{print $NF}'` == "$wiface" ]]; then
+            $_iptables -t mangle -A WLB_OUT -m mark --mark 0x0 -j MARK --set-xmark $fwmark
+        fi
+
+        i=$(($i + 1))
+    done
+    #Create restore-mark rule and member WLB_PRE chain
+    $_iptables -t mangle -A WLB_OUT -j CONNMARK --save-mark
+}
+
+
+function del_netfilter_settings() {
+
+    $_iptables -t mangle -F WLB_PRE
+    $_iptables -t mangle -D PREROUTING -j WLB_PRE
+    $_iptables -t mangle -X WLB_PRE
+    $_iptables -t mangle -F WLB_OUT
+    $_iptables -t mangle -D OUTPUT -j WLB_OUT
+    $_iptables -t mangle -X WLB_OUT
+    $_iptables -t mangle -F STICKY_CONN
+    $_iptables -t mangle -D PREROUTING -j STICKY_CONN
+    $_iptables -t mangle -X STICKY_CONN
+    $_iptables -t nat -F WLB_SNAT
+    $_iptables -t nat -D POSTROUTING -j WLB_SNAT
+    $_iptables -t nat -X WLB_SNAT
+
+}
+

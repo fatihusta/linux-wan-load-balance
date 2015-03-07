@@ -1,0 +1,215 @@
+#!/bin/bash
+config_cache=/etc/sysconfig/wan-load-balance/wlb.conf.cache
+config_failover=/etc/sysconfig/wan-load-balance/wlb.conf.failover
+statedir=/tmp/
+
+_iptables=`which iptables`
+_ip=`which ip`
+
+
+function getvalue() {
+    index=$1
+    var=$2
+
+    n=1
+    for f in ${var} ; do
+        if [ "${n}" == "${index}" ]; then
+            echo "$f"
+            break
+        fi
+            n=$(($n + 1))
+    done
+}
+
+#Bu fonksiyon ethernet gidip tekrar geri geldiğinde ilgili route table için gerekli rota bilgilerini yeniden ekliyor.
+function replace_routing_table_up_iface() {  
+    
+    . $config_failover
+
+    tid=$1
+    wiface=$2
+    router=$3
+
+    #ilgili route table'a ait rota bilgilerini sıfırla
+    $_ip route flush table $tid
+
+    #ilgili route table için ön tanımlı ağ geçidini gir.
+    $_ip route add table $tid default via $router dev $wiface
+
+    #main routing table değerlerini ilgili routerlar için ayrılan tablolara ekle.
+    $_ip route show table main | grep -Ev '^default|nexthop' | \
+    while read ROUTE ; do
+        for tid in $route_table_ids; do
+            $_ip route add table $tid $ROUTE 
+        done
+    done
+}
+
+#Bu fonksiyon hat gittiğinde iptables/netfilter kurallarını yeniden yazıyor.
+function replace_netfilter_settings() {
+    #Hatların son durumlarına ait ayarların bulunduran dosyayı yükle. Bu dosyayı wan_load_balance ilk çalışmada oluşturur.
+    . $config_failover
+
+    #WLB_PRE ve STICKY_CONN iptables zincirlerini temizle
+    $_iptables -t mangle -F WLB_PRE
+    $_iptables -t mangle -F STICKY_CONN
+
+    #WLB_PRE zincirinin en üstüne marklar yeniden yükleyecek kuralı ekle
+    $_iptables -t mangle -I WLB_PRE -j CONNMARK --restore-mark
+
+    i=1
+    #WLB_PRE ve STICKY_CONN zincirlerini config_failover'daki değişkenlere göre yeniden oluştur.
+    for wiface in $wan_ifaces; do
+        #Load values
+        fwmark=$(getvalue $i "$fwmarks")
+        wan_iface_ip=$(getvalue $i "$wan_iface_ips")
+        router_weight=$(getvalue $i "$weights")
+        #Toplam ağırlığı hesapla
+        sum_weight=`echo $weights | tr ' ' '+' | bc`
+        #İlgili router'için belirlenen ağırlık oranında toplam ağırlık üzerinden router ağırlık değerini hesapla
+        weight=`echo "scale=6; 1/$sum_weight*$router_weight" | bc`
+
+        #WLB_PRE Zincirinde toplam trafiği ilgili marklara ve ağırlıklarına göre dağıtacak kuralları yeniden ekle.
+        #Eklenecek kurallardan sonuncusu olmayana kadar ekle
+        if [[ `echo $wan_ifaces | awk '{print $NF}'` != "$wiface" ]]; then
+            $_iptables -t mangle -A WLB_PRE -m mark --mark 0x0 -m statistic --mode random --probability 0$weight -j MARK --set-xmark $fwmark
+        #Ekelenecek kurallardan sonuncusu ise ekle. Sonuncusuna ağırlık verilmeyip geri kalanı şeklinde davranılıyor. statistic modülü ile ilgili bir durum.
+        elif [[ `echo $wan_ifaces | awk '{print $NF}'` == "$wiface" ]]; then
+            $_iptables -t mangle -A WLB_PRE -m mark --mark 0x0 -j MARK --set-xmark $fwmark
+        fi
+        
+        #Eğer stick inbound wan connection seçeneği aktif ise ilgili marklarına göre kuralları ekle.
+        if [[ $sticky_inbound_wan_connections == "y"  ]]; then
+            $_iptables -t mangle -A STICKY_CONN -i "$wiface" -m mark --mark 0x0 -j MARK --set-xmark $fwmark
+        fi
+
+        i=$(($i + 1))
+    done
+    #WLB_PRE zincirinin en sonuna markları kaydedecek kuralı ekle.
+    $_iptables -t mangle -A WLB_PRE -j CONNMARK --save-mark
+}
+
+#Bu fonksiyon Kendinden çıkan trafik load balance içerinde gireceği için OUTPUT zincirine eklenecek kuralları WLB_OUT zincirine ekler.
+function replace_netfilter_output_settings() {
+    . $config_failover
+
+    #WLB_OUT zincirini temizle
+    $_iptables -t mangle -F WLB_OUT
+    #marklanmış paketleri yeniden yükleyecek kuralı WLB_OUT zincirinin en üstüne ekle.
+    $_iptables -t mangle -I WLB_OUT -j CONNMARK --restore-mark
+
+    i=1
+
+    #WLB_OUT zincirini config_failover'daki değişkenlere göre yeniden oluştur.
+    for wiface in $wan_ifaces; do 
+        #ilgili değişlenleri sırası ile yükle. i değişleni değerine göre sırası ile liste elemanlarını getirir.
+        fwmark=$(getvalue $i "$fwmarks")
+        wan_iface_ip=$(getvalue $i "$wan_iface_ips")
+        router_weight=$(getvalue $i "$weights")
+
+        #Toplam ağırlığı hesapla
+        sum_weight=`echo $weights | tr ' ' '+' | bc`
+        #İlgili router'için belirlenen ağırlık oranında toplam ağırlık üzerinden router ağırlık değerini hesapla
+        weight=`echo "scale=6; 1/$sum_weight*$router_weight" | bc`
+
+        #WLB_OUT Zincirinde toplam trafiği ilgili marklara ve ağırlıklarına göre dağıtacak kuralları yeniden ekle.
+        #Eklenecek kurallardan sonuncusu olmayana kadar ekle
+        if [[ `echo $wan_ifaces | awk '{print $NF}'` != "$wiface" ]]; then
+            $_iptables -t mangle -A WLB_OUT -m mark --mark 0x0 -m statistic --mode random --probability 0$weight -j MARK --set-xmark $fwmark
+	
+        #Ekelenecek kurallardan sonuncusu ise ekle. Sonuncusuna ağırlık verilmeyip geri kalanı şeklinde davranılıyor. statistic modülü ile ilgili bir durum.
+        elif [[ `echo $wan_ifaces | awk '{print $NF}'` == "$wiface" ]]; then
+            $_iptables -t mangle -A WLB_OUT -m mark --mark 0x0 -j MARK --set-xmark $fwmark
+        fi
+
+        i=$(($i + 1))
+    done
+    #WLB_OUT zincirinin en sonuna markları kaydedecek kuralı ekle.
+    $_iptables -t mangle -A WLB_OUT -j CONNMARK --save-mark
+}
+
+#Bu fonksiyon dead_router_detectiondan aldığı router tablo numarası ile ilgili router'in down olduğunu anlayıp config_failover içerisindeki ayarları değiştirir. i
+#Down olan router'i config_faiover içerisinden çıkartır.
+function router_down_replace_config() {
+    
+    #failover durumunda oluşan son dosyadaki değişkenleri yükle.
+    . $config_failover
+    # dead_router_detection dan gelen down olan router'in tablo numarası
+    d_tid=$1
+    #Basit kontrol. Boş gelmesi durumunda çalışmasın diye.
+    if [[ $1 != "" ]]; then
+        i=1
+        for tid in $route_table_ids; do
+            #Bütün ayarları tek tek çağır.
+            wiface=$(getvalue $i "$wan_ifaces")
+            fwmark=$(getvalue $i "$fwmarks")
+            wan_iface_ip=$(getvalue $i "$wan_iface_ips")
+            router=$(getvalue $i "$routers")
+            weight=$(getvalue $i "$weights")
+            #Aktif olan hatların bilgilerini topla. down olan hariç. 
+            if [[ $d_tid != $tid ]]; then
+                #yeni değişkene toplanan aktif hatları ata
+                r_route_table_ids="$r_route_table_ids $tid"
+                r_fwmarks="$r_fwmarks $fwmark"
+                r_wan_ifaces="$r_wan_ifaces $wiface"
+                r_wan_iface_ips="$r_wan_iface_ips $wan_iface_ip"
+                r_routers="$r_routers $router"
+                r_weights="$r_weights $weight"
+            fi
+        i=$(($i + 1))
+        done
+        #Yeni değerlere göre config_failover dosyasında ilgili değerleri düzenle.
+        sed -i "s/^route_table_ids=\"$route_table_ids\"/route_table_ids=\"$r_route_table_ids\"/g" $config_failover
+        sed -i "s/^fwmarks=\"$fwmarks\"/fwmarks=\"$r_fwmarks\"/g" $config_failover
+        sed -i "s/^wan_ifaces=\"$wan_ifaces\"/wan_ifaces=\"$r_wan_ifaces\"/g" $config_failover
+        sed -i "s/^wan_iface_ips=\"$wan_iface_ips\"/wan_iface_ips=\"$r_wan_iface_ips\"/g" $config_failover
+        sed -i "s/^routers=\"$routers\"/routers=\"$r_routers\"/g" $config_failover
+        sed -i "s/^weights=\"$weights\"/weights=\"$r_weights\"/g" $config_failover
+    fi
+   #Yeni duruma göre bu değişkenleri çalıştır ve yeni kuralları uygula.
+   replace_netfilter_settings
+   replace_netfilter_output_settings
+}
+#Bu fonksiyon router up olduğu durumda çalışır. 
+function router_up_replace_config() {
+    #Son failover dosyasını yükle.
+    . $config_failover
+    #dead_router_detection scriptinin gönderdiği up olan hatta ait değerler
+    tid=$1
+    fwmark=$2
+    wiface=$3
+    wan_iface_ip=$4
+    router=$5
+    weight=$6
+    # basit kontrol, boş gelirse diye.
+    if [[ $1 != "" ]]; then
+        #config_failover dosyasındaki değişkenlere up olan hattı ekleyip değişkeni yeniden oluştur.
+        r_route_table_ids="$route_table_ids $tid"
+        r_fwmarks="$fwmarks $fwmark"
+        r_wan_ifaces="$wan_ifaces $wiface"
+        r_wan_iface_ips="$wan_iface_ips $wan_iface_ip"
+        r_routers="$routers $router"
+        r_weights="$weights $weight"
+        #Yeni değerlere göre config_failover dosyasını düzenle.
+        sed -i "s/^route_table_ids=\"$route_table_ids\"/route_table_ids=\"$r_route_table_ids\"/g" $config_failover
+        sed -i "s/^fwmarks=\"$fwmarks\"/fwmarks=\"$r_fwmarks\"/g" $config_failover
+        sed -i "s/^wan_ifaces=\"$wan_ifaces\"/wan_ifaces=\"$r_wan_ifaces\"/g" $config_failover
+        sed -i "s/^wan_iface_ips=\"$wan_iface_ips\"/wan_iface_ips=\"$r_wan_iface_ips\"/g" $config_failover
+        sed -i "s/^routers=\"$routers\"/routers=\"$r_routers\"/g" $config_failover
+        sed -i "s/^weights=\"$weights\"/weights=\"$r_weights\"/g" $config_failover
+    fi
+   #Eğer interface down up oldu ise ek olarak bunu çalıştır. 
+   if [[ `cat $statedir/$wiface.state` == "1" ]];then
+      replace_routing_table_up_iface $tid $wiface $router
+      echo "0" > $statedir/$wiface.state
+   fi
+   #Yeni kuralların uygulanması için bu fonksiyonları çağır.
+   replace_netfilter_settings 
+   replace_netfilter_output_settings
+}
+#dead_router_detection'dan değerler bu şekilde alınıyor.
+if [[ $1 == "down" ]]; then 
+    router_down_replace_config $2
+elif [[ $1 == "up"  ]];then
+    router_up_replace_config $2 $3 $4 $5 $6 $7
+fi

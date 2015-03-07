@@ -1,0 +1,139 @@
+#!/bin/bash 
+#Dead router detection
+
+apply_failover=/usr/sbin//apply_failover
+configdir=/etc/sysconfig/wan-load-balance
+config_cache=/etc/sysconfig/wan-load-balance/wlb.conf.cache
+statedir=/tmp/
+
+_progname=`basename $0`
+_ping=`which ping`
+
+if [ -f $config_cache ]; then
+    . $config_cache
+else
+    echo "Config file not found. >>> $config_cache" |  logger
+    exit 1
+fi
+
+if [[ $dead_router_detection != "y" ]]; then
+    echo "WLB: $_progname: Disable"
+    exit 1
+fi
+
+function getvalue() {
+    index=$1
+    var=$2
+
+    n=1
+    for f in ${var} ; do
+        if [ "${n}" == "${index}" ]; then
+            echo "$f"
+            break
+        fi
+            n=$(($n + 1))
+    done
+}
+
+#İlk çalışmada bütün durumları sıfırla.
+for router in $routers; do 
+    echo "0" > $statedir/$router.state
+    echo "0" > $statedir/$router.fail_count
+    echo "0" > $statedir/$router.success_count
+done
+
+while : ; do
+    #Uygulanmış ayarları yükle
+    . $config_cache
+    
+    #Test tekrar zamanı
+    sleep $sleep_time
+
+    i=1
+    for wiface in $wan_ifaces; do
+        #getvalue fonksiyonu ile sırası ile değerleri getir. Bu değerler uygulanmış ayar dosyasından alınıyor. "i" değişkeni her arttığında listenin bir sonraki elemanlarını çağırıyor.
+        tid=$(getvalue $i "$route_table_ids")
+        fwmark=$(getvalue $i "$fwmarks")
+        wan_iface_ip=$(getvalue $i "$wan_iface_ips")
+        router=$(getvalue $i "$routers")
+        weight=$(getvalue $i "$weights")
+
+        #Her test başladığında failure_count ve success_count değerlerini ilgili router için geri çağırıyor.
+        test_fail_count=`cat $statedir/$router.fail_count`
+        test_success_count=`cat $statedir/$router.success_count`
+        #Ethernet'in açık olmasına ve kablo takılı olmasına bakıyor.
+        if [ -f /sys/class/net/$wiface/operstate ]; then
+            operstate=`cat /sys/class/net/$wiface/operstate`
+        fi
+        #Eğer ethernet açık ve kablo takılı ise testlere başlıyor. Değil ise elif'e girip hat yoktur deyor.
+        if [[ $operstate == "up" ]]; then
+            #Bütün test hostlarını tek tek gezerek her router için çalıştırıyor.
+            for test_host in $test_hosts; do 
+                #ping testi
+                $_ping -W $timeout -c $count -i $interval -I $wan_iface_ip $test_host 2>&1 > /dev/null
+                check=`echo $?` #ping testi sonucu.
+                 #Eğer sonuç 0 değil ise işlem başarısızdır.
+                 if [[ $check != "0" ]]; then
+                    echo "WLB: $_progname: [WARNING] Ip=$wan_iface_ip Iface=$wiface Router=$router - Test IP $test_host is not reachable!" | logger
+                    #ping teti başarısız olduğu için failure_count değerini 1 arttırır.
+                    test_fail_count=$(($test_fail_count +1))
+                    #Bunu ilgili dosyasına yazar. Test tekrar edilirken ilk başta bu dosyadaki değer yüklenir. Buna göre sayaç her başarısız işlemde 1 arttırılır.
+                    echo "$test_fail_count" > $statedir/$router.fail_count
+                 #Eğer sonuç 0 ise ping testi başarılıdır.
+                 elif [[ $check == "0" ]]; then
+                    #Ping testi başarılı ise ve hattın durumu 0 yani hat ayakta ise 
+                    if [[ `cat $statedir/$router.state` == "0"  ]] ;then
+                        #Failure count sıfırlanır.
+                        echo "0" > $statedir/$router.fail_count
+                    fi
+                    #Eğer hat ayakta değil ise ve ping testi başarılı ise
+                    if [[ `cat $statedir/$router.state` != "0"  ]];then
+                        #Başarılı test eşik değeri sayısı ile Başarılı işlem sayısı birbirine eşit değil ise
+                        if [[ $test_success_count != $success_count ]]; then
+                            #Başarılı işlem sayacını 1 arttır. Bunu ilgili sayaç dosyasına yaz.
+                            test_success_count=$(($test_success_count +1))
+                            echo "$test_success_count" > $statedir/$router.success_count
+                        fi
+                    fi
+                 fi
+            done
+            #Hata eşik değeri sayısı, toplam test hata sayısına eşit ve küçük ise 
+            if [[ $failure_count -le $test_fail_count ]]; then
+                #Router'in durumu 1 değil ise yani daha önce hattın gittiği işaretlenmemişse
+                if [[ `cat $statedir/$router.state` != "1" ]]; then
+                    #Hat gitmiştir.
+                    echo "WLB: $_progname: [WARNING] Ip:$wan_iface_ip Iface:$wiface Router=$router - Router is down!" | logger
+                    #Hattın ilgili router'ine ait state dosyasını 1 yani down olarak değiştir.
+                    echo "1" > $statedir/$router.state
+                    #Hattın durumunun down olduğunu router tablo numarası ile değişiklikleri yapacak script'e ver. Bu script ilgili table'a ait kuralları iptables'dan çıkartacak.
+                    $apply_failover down $tid &
+                fi
+            fi
+            #Eğer başarılı test sonucu ile başarılı işlem eşik değeri birbirine eşit ise
+            if [[ $success_count == $test_success_count ]]; then 
+                #router'in durumu 0 değil ise yani daha önceden hat zaten açık ise
+                if [[ `cat $statedir/$router.state` != "0" ]]; then
+                    #Router açık yani internet var. Bütün durumları sıfırla 
+                    echo "WLB: $_progname: [RUNNING] Ip:$wan_iface_ip Iface=$wiface Router=$router - Router is up" | logger
+                    echo "0" > $statedir/$router.state
+                    echo "0" > $statedir/$router.fail_count
+                    echo "0" > $statedir/$router.success_count
+                    #Hattın geldiğini ve kural değişikliklerini yapması için apply_failover scriptini ilgili hatta ait bilgiler ile çalıştır.
+                    $apply_failover up $tid $fwmark $wiface $wan_iface_ip $router $weight &
+                fi
+            fi    
+        #Eğer ethernette hat yok ise veya ethernet kapalı ise hat gitmiştir.
+        elif [[ "$operstate" == "down" ]]; then
+            #Hattun durumu daha önceden 1 yani hat yok olarak ayarlanmamışsa
+            if [[ `cat $statedir/$router.state` != "1" ]]; then
+                #Link veya ethernet gitmiştir. Hattın durumunu ve ethernetin durumunu 1 yani hat ve ethernet gitmiş olarak değiştir.
+                echo "WLB: $_progname: [WARNING] Ip:$wan_iface_ip Iface=$wiface Router=$router - Link is Down!" | logger
+                echo "1" > $statedir/$router.state 
+                echo "1" > $statedir/$wiface.state #Ethernetin durumunu tekrar açık olarak apply_failover değiştiriyor.
+                #Hattın gittiğini ilgili router'in tablo numarası ise apply_failover scriptine gerekli değişiklikleri yapması için bildir.
+                $apply_failover down $tid  &
+            fi
+        fi
+       i=$(($i + 1))
+    done
+done

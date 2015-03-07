@@ -1,0 +1,57 @@
+#!/bin/bash
+#chkconfig: 2345 95 20
+
+script=/usr/sbin/wan_load_balance
+
+. /etc/init.d/functions
+
+if [ -f $script ]; then
+    . $script
+else
+    echo "$script not found !!"
+    exit 1
+fi
+
+
+case $1 in
+    start) 
+        pid=`ps aux | grep dead_router_detection | grep -v grep |awk '{print $2}'`
+        if [ "$pid" == "" ]; then
+            echo -n "Starting Wan Load Balance: "
+            sleep 1     
+            start_wan_load_balancing
+            echo "ok"
+        else
+            echo "Already running"
+        fi
+    ;;   
+    stop)
+        pid=`ps aux | grep dead_router_detection | grep -v grep |awk '{print $2}'`
+        if [ "$pid" != "" ]; then     
+            echo -n "Stoping Wan Load Balance: "
+            kill -9 $pid 
+            stop_wan_load_balancing 
+            echo "ok"
+        fi
+    ;;
+    restart) 
+        pid=`ps aux | grep dead_router_detection | grep -v grep |awk '{print $2}'`
+        if [ "$pid" != "" ]; then     
+            echo -n "Stoping Wan Load Balance: "
+            kill -9 $pid 
+            stop_wan_load_balancing
+            sleep 1 
+            echo "ok"
+            echo -n "Starting Wan Load Balance: "
+            sleep 1 
+            start_wan_load_balancing
+            echo "ok"
+        elif [ "$pid" == "" ]; then     
+            echo -n " Starting Wan Load Balance: "
+            sleep 1 
+            start_wan_load_balancing
+            echo "ok"
+        fi
+    ;;
+    *) echo "Usage: $0 [start|stop|restart]" ; echo ; exit 1 ;;
+esac
