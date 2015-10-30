@@ -50,6 +50,7 @@ function start_wan_load_balancing() {
     add_route_and_rule_settings
     add_netfilter_settings
     add_netfilter_output_settings
+    add_netfilter_raw_table_settings
     $dead_router_detection_functions & 
 
     if [[ `echo $?` == 0 ]]; then
@@ -275,6 +276,14 @@ function add_netfilter_output_settings() {
     $_iptables -t mangle -A WLB_OUT -j CONNMARK --save-mark
 }
 
+function add_netfilter_raw_table_settings() {
+
+    $_iptables -t raw -N WLB_RAW
+    $_iptables -t raw -I WLB_RAW -j ACCEPT
+    $_iptables -t raw -I PREROUTING $wlb_raw_pre_rule_no -j WLB_RAW
+    $_iptables -t raw -I OUTPUT $wlb_raw_out_rule_no -j WLB_RAW
+
+}
 
 function del_netfilter_settings() {
 
@@ -290,6 +299,10 @@ function del_netfilter_settings() {
     $_iptables -t nat -F WLB_SNAT
     $_iptables -t nat -D POSTROUTING -j WLB_SNAT
     $_iptables -t nat -X WLB_SNAT
+    $_iptables -t raw -D PREROUTING -j WLB_RAW
+    $_iptables -t raw -D OUTPUT -j WLB_RAW
+    $_iptables -t raw -X WLB_RAW
+
 
 }
 
