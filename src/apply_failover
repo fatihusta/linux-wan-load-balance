@@ -63,6 +63,7 @@ function replace_netfilter_settings() {
     $_iptables -t mangle -I WLB_PRE -j CONNMARK --restore-mark
 
     i=1
+    used_weight=0
     #WLB_PRE ve STICKY_CONN zincirlerini config_failover'daki değişkenlere göre yeniden oluştur.
     for wiface in $wan_ifaces; do
         #Load values
@@ -72,12 +73,13 @@ function replace_netfilter_settings() {
         #Toplam ağırlığı hesapla
         sum_weight=`echo $weights | tr ' ' '+' | bc`
         #İlgili router'için belirlenen ağırlık oranında toplam ağırlık üzerinden router ağırlık değerini hesapla
-        weight=`echo "scale=6; 1/$sum_weight*$router_weight" | bc`
+        weight=`echo "scale=6; 1 / ( $sum_weight - $used_weight ) * $router_weight" | bc`
 
         #WLB_PRE Zincirinde toplam trafiği ilgili marklara ve ağırlıklarına göre dağıtacak kuralları yeniden ekle.
         #Eklenecek kurallardan sonuncusu olmayana kadar ekle
         if [[ `echo $wan_ifaces | awk '{print $NF}'` != "$wiface" ]]; then
             $_iptables -t mangle -A WLB_PRE -m mark --mark 0x0 -m statistic --mode random --probability 0$weight -j MARK --set-xmark $fwmark
+	    used_weight=$(($used_weight + $router_weight))
         #Ekelenecek kurallardan sonuncusu ise ekle. Sonuncusuna ağırlık verilmeyip geri kalanı şeklinde davranılıyor. statistic modülü ile ilgili bir durum.
         elif [[ `echo $wan_ifaces | awk '{print $NF}'` == "$wiface" ]]; then
             $_iptables -t mangle -A WLB_PRE -m mark --mark 0x0 -j MARK --set-xmark $fwmark
@@ -104,7 +106,7 @@ function replace_netfilter_output_settings() {
     $_iptables -t mangle -I WLB_OUT -j CONNMARK --restore-mark
 
     i=1
-
+    used_weight=0
     #WLB_OUT zincirini config_failover'daki değişkenlere göre yeniden oluştur.
     for wiface in $wan_ifaces; do 
         #ilgili değişlenleri sırası ile yükle. i değişleni değerine göre sırası ile liste elemanlarını getirir.
@@ -115,13 +117,13 @@ function replace_netfilter_output_settings() {
         #Toplam ağırlığı hesapla
         sum_weight=`echo $weights | tr ' ' '+' | bc`
         #İlgili router'için belirlenen ağırlık oranında toplam ağırlık üzerinden router ağırlık değerini hesapla
-        weight=`echo "scale=6; 1/$sum_weight*$router_weight" | bc`
+        weight=`echo "scale=6; 1 / ( $sum_weight - $used_weight ) * $router_weight" | bc`
 
         #WLB_OUT Zincirinde toplam trafiği ilgili marklara ve ağırlıklarına göre dağıtacak kuralları yeniden ekle.
         #Eklenecek kurallardan sonuncusu olmayana kadar ekle
         if [[ `echo $wan_ifaces | awk '{print $NF}'` != "$wiface" ]]; then
             $_iptables -t mangle -A WLB_OUT -m mark --mark 0x0 -m statistic --mode random --probability 0$weight -j MARK --set-xmark $fwmark
-	
+	    used_weight=$(($used_weight + $router_weight))
         #Ekelenecek kurallardan sonuncusu ise ekle. Sonuncusuna ağırlık verilmeyip geri kalanı şeklinde davranılıyor. statistic modülü ile ilgili bir durum.
         elif [[ `echo $wan_ifaces | awk '{print $NF}'` == "$wiface" ]]; then
             $_iptables -t mangle -A WLB_OUT -m mark --mark 0x0 -j MARK --set-xmark $fwmark
